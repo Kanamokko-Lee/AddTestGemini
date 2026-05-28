@@ -366,11 +366,11 @@ function saveConfig(){
   initGapi();
 }
 
-function updateAuthStatus(){
+function updateAuthStatus(msg){
   const hasKey = !!localStorage.getItem('cfg_api_key');
   const hasId  = !!localStorage.getItem('cfg_client_id');
   document.getElementById('auth-status').textContent =
-    (!hasKey || !hasId) ? '⚙ 設定が必要です' : '設定済み・取得準備OK';
+    msg || ((!hasKey || !hasId) ? '⚙ 設定が必要です' : (loadToken() ? 'ログイン済み ✓' : '設定済み・取得準備OK'));
 }
 
 /* ══ Google API 初期化 ══ */
@@ -393,6 +393,20 @@ function onGapiLoad(){
 
 function onGisLoad(){ initGis(); }
 
+/* ══ トークン保存・復元 ══ */
+function saveToken(token){
+  const data = { token, expires: Date.now() + 55*60*1000 }; // 55分で期限切れ扱い
+  localStorage.setItem('gapi_token', JSON.stringify(data));
+}
+function loadToken(){
+  try {
+    const data = JSON.parse(localStorage.getItem('gapi_token'));
+    if(data && data.expires > Date.now()) return data.token;
+  } catch(e){}
+  return null;
+}
+function clearToken(){ localStorage.removeItem('gapi_token'); }
+
 function initGis(){
   const clientId = localStorage.getItem('cfg_client_id');
   if(!clientId || !window.google?.accounts) return;
@@ -404,11 +418,20 @@ function initGis(){
     ].join(' '),
     callback: async (resp) => {
       if(resp.error){ showToast('認証エラー: ' + resp.error); return; }
+      saveToken(resp); // トークンを保存
+      gapi.client.setToken(resp);
       if(pendingAction === 'fetch') await doFetch();
       else if(pendingAction === 'register') await doRegisterAll();
       pendingAction = null;
     }
   });
+
+  // 保存済みトークンがあれば復元
+  const saved = loadToken();
+  if(saved){
+    gapi.client.setToken(saved);
+    updateAuthStatus('ログイン済み ✓');
+  }
 }
 
 function initGapi(){
@@ -417,7 +440,7 @@ function initGapi(){
 }
 
 /* ══ 認証→処理の共通フロー ══ */
-function withAuth(action){
+async function withAuth(action){
   if(!localStorage.getItem('cfg_api_key') || !localStorage.getItem('cfg_client_id')){
     showToast('⚙ 設定を開き、APIキーとクライアントIDを入力してください');
     toggleConfig(); return;
@@ -425,9 +448,19 @@ function withAuth(action){
   if(!isGapiReady){ showToast('API初期化中です。数秒後に再度お試しください'); return; }
   if(!tokenClient){ initGis(); if(!tokenClient){ showToast('GIS初期化エラー。設定を確認してください'); return; } }
 
+  // 保存済みの有効なトークンがあればそのまま実行
+  const saved = loadToken();
+  if(saved){
+    gapi.client.setToken(saved);
+    pendingAction = null;
+    if(action === 'fetch') await doFetch();
+    else if(action === 'register') await doRegisterAll();
+    return;
+  }
+
+  // トークンなし or 期限切れ → 認証フロー（初回 or 1時間後のみ）
   pendingAction = action;
-  const token = gapi.client.getToken();
-  tokenClient.requestAccessToken({ prompt: token ? '' : 'consent' });
+  tokenClient.requestAccessToken({ prompt: 'select_account' });
 }
 
 /* ══ フライトデータ取得 ══ */
@@ -470,7 +503,8 @@ async function doFetch(){
     showToast(`同期完了：${EVENTS.length}件取得`);
   } catch(e){
     const msg = e.result?.error?.message || e.message || JSON.stringify(e);
-    showToast('取得失敗: ' + msg);
+    if(e.result?.error?.code === 401){ clearToken(); updateAuthStatus(); showToast('再ログインが必要です。もう一度タップしてください'); }
+    else showToast('取得失敗: ' + msg);
     console.error(e);
   }
 }
